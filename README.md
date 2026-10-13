@@ -1,46 +1,57 @@
-# Sojib Pay (starter)
+# Sojib Pay v2 — Merchant Gateway Foundation
 
-A mobile-first payment submission and support prototype for BDT Send Money workflows.
+Mobile-first Node.js/Express + PostgreSQL project extended from the supplied Sojib Pay starter ZIP.
 
-## Important limitations
+## What is included
+- Existing customer sign-in, payment submission, support chat and admin payment review.
+- Merchant application flow at `/merchant.html`.
+- Admin merchant approval/suspension controls at `/admin.html`.
+- Merchant API-key issuance (only after admin approval), revocation and a starter endpoint `POST /api/v1/payment-requests`.
+- Request record lookup at `/checkout.html?id=...` and developer guide at `/developers.html`.
+- SMS receipt intake at `POST /api/connector/sms-receipt`, with secret header and SHA-256 receipt hash validation; receipts are stored as `pending_review` and never automatically approve a payment.
+- Payment records are no longer deleted 12 hours after approval/rejection. Keep an appropriate retention policy and backups.
 
-- This is a **starter project**, not a production-ready payment gateway.
-- It does not read Android SMS by itself. `/api/connector/sms-receipt` accepts an authenticated receipt from a separate, audited Android connector.
-- `source_verified: true` is only a claim from that connector, not proof by itself. Do not enable automatic approval for real money until the collector validates trusted sender metadata and the wallet's receipt format, and you have tested it thoroughly.
-- SMS sender names/numbers can be spoofed in some contexts. A transaction record from the wallet provider is more authoritative than SMS alone.
-- This project uses personal Send Money account settings, not official merchant settlement. Check each wallet provider's terms before collecting business payments.
-- The app does not implement file uploads for screenshots. Customers can paste transaction details in support chat; add secure file storage with file-type checks, malware scanning and access controls before allowing evidence uploads.
-- The 12-hour cleanup deletes finalized payment records. This can conflict with accounting, chargeback handling, legal retention and duplicate prevention. Get appropriate advice and retain only the minimum non-sensitive deduplication data needed. Do not use this default blindly in production.
-- Live chat is implemented as authenticated polling plus WebSocket refresh hints, not a guaranteed always-connected helpdesk.
-- Render free services/databases may sleep, have limited persistence/availability, or change plan limits. Production payments need reliable paid hosting, backups and monitoring.
+## Critical production limitation
+**This is not a live payment gateway yet.** It does not connect to official bKash, Nagad or Rocket APIs and does not collect or settle funds. The checkout URL displays a request record, not an actual wallet checkout. Before real payments, obtain provider/partner approval, implement their documented server-side APIs and callbacks, validate callback signatures, reconcile provider transaction records, and confirm applicable Bangladesh legal/regulatory requirements. Do not treat personal Send Money accounts as an authorized gateway.
 
-## Local development
+SMS is not a source of cryptographic proof. Sender names may be spoofed; a sender label or `source_verified` field is not sufficient. The connector requires a separate, audited Android app or authorized provider integration. In this version all SMS receipts go to manual review. Never send SMS containing PINs, OTPs or full account secrets.
 
-1. Install Node.js 20+ and PostgreSQL.
-2. Create a database named `sojibpay`.
-3. Copy `.env.example` to `.env`.
-4. Set a long random `JWT_SECRET`, a different long random `SMS_WEBHOOK_SECRET`, and a strong `ADMIN_PASSWORD`.
-5. Set `DATABASE_URL` to your PostgreSQL connection string.
-6. Run `npm install`, then `npm start`.
-7. Open `http://localhost:3000`; admin UI is at `/admin.html`.
+## Render environment
+Set these in Render Dashboard > your web service > Environment:
+- `NODE_ENV=production`
+- `DATABASE_URL` (Render PostgreSQL connection string)
+- `PGSSL=true` if required for the database connection
+- `JWT_SECRET`: random secret, at least 32 characters
+- `SMS_WEBHOOK_SECRET`: different random secret, at least 24 characters
+- `ADMIN_EMAIL`
+- `ADMIN_PASSWORD`: strong initial admin password
 
-## Render deployment
+Never commit `.env` or real credentials to GitHub. If an existing service already has a database, keep the existing database URL; do not create a new database or change it without a backup.
 
-1. Push this folder to a private GitHub repository.
-2. In Render, create a PostgreSQL database and a Web Service from the repository.
-3. Set `DATABASE_URL` to the database's internal connection string and `PGSSL=true` if required.
-4. Set `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `JWT_SECRET`, `SMS_WEBHOOK_SECRET`. Never commit `.env`.
-5. Deploy. Visit `/admin.html`, sign in, and configure wallet account numbers.
-6. Test using small, authorized test payments before public launch. Add a real Android SMS collector only after security review.
+## Run locally
+1. Use Node.js 20+ and PostgreSQL.
+2. `npm install`
+3. Set environment variables (copy `.env.example` to `.env`).
+4. `npm start`
+5. Open `http://localhost:3000`, merchant console `/merchant.html`, developer guide `/developers.html`, admin `/admin.html`.
 
-## API outline
+## Mobile deployment using GitHub + Render
+1. Back up the existing repository and database before replacing files.
+2. Extract this ZIP on your phone or upload its files to the existing GitHub repository (keep the project root files at repository root, not inside an extra nested folder).
+3. Review changes, commit them to the branch linked to Render.
+4. In Render, confirm the service is linked to the correct repository/branch and that `npm install` / `npm start` are configured. Render normally redeploys after a push to the connected branch.
+5. Check the Deploys and Logs pages. Confirm `/api/health`, `/merchant.html`, `/developers.html`, and `/admin.html` load.
+6. Sign in with a normal user account, open Merchant Console, submit the business application. Sign in as admin to `/admin.html` and approve only after checking the business.
+7. Test payment requests with non-real/test data. Do not enable real payments until official provider APIs and required approvals are integrated.
 
-- `POST /api/auth/signup`, `POST /api/auth/login`, `POST /api/auth/logout`
-- `POST /api/payments`, `GET /api/payments/mine`
-- `GET /api/support/:paymentId`, `POST /api/support/:paymentId`
-- `GET /api/admin/overview`, `GET /api/admin/payments`
-- `POST /api/admin/payments/:id/decision`
-- `GET /api/admin/settings`, `PUT /api/admin/settings/:provider`
-- `POST /api/connector/sms-receipt` (requires `X-SMS-Secret` header)
+## Key API routes
+- `POST /api/merchant/apply` (session auth)
+- `GET /api/merchant/me` (session auth)
+- `POST /api/merchant/keys` (approved merchants only; secret displayed once)
+- `POST /api/v1/payment-requests` with `X-SojibPay-Key` (approved merchant only)
+- `GET /api/checkout/:publicId`
+- `GET /api/admin/merchants` and `POST /api/admin/merchants/:id/status` (admin only)
+- `GET /api/admin/sms-receipts` (admin only)
+- `POST /api/connector/sms-receipt` with `X-SMS-Secret` (queues for manual review; never auto-approves)
 
-The starter is intentionally not configured to accept uploaded evidence or to blindly trust arbitrary SMS content.
+This code is a development foundation and requires security review, integration tests, operational monitoring, backup/restore testing, and official provider integration before handling real money.

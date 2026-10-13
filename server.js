@@ -77,6 +77,27 @@ async function initDb() {
       id BIGSERIAL PRIMARY KEY, admin_id BIGINT, action TEXT NOT NULL, payment_id BIGINT,
       details JSONB NOT NULL DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS merchants (
+      id BIGSERIAL PRIMARY KEY, user_id BIGINT UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      business_name TEXT NOT NULL, website TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending_review'
+        CHECK (status IN ('pending_review','approved','suspended')), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS merchant_api_keys (
+      id BIGSERIAL PRIMARY KEY, merchant_id BIGINT NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+      key_prefix TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, secret_hash TEXT NOT NULL,
+      label TEXT NOT NULL DEFAULT 'Default key', revoked BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS payment_requests (
+      id BIGSERIAL PRIMARY KEY, merchant_id BIGINT NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+      public_id TEXT UNIQUE NOT NULL, amount NUMERIC(12,2) NOT NULL CHECK(amount > 0), currency TEXT NOT NULL DEFAULT 'BDT',
+      description TEXT NOT NULL DEFAULT '', customer_reference TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '30 minutes')
+    );
+    CREATE TABLE IF NOT EXISTS sms_receipts (
+      id BIGSERIAL PRIMARY KEY, provider TEXT NOT NULL, trx_id TEXT NOT NULL, amount NUMERIC(12,2) NOT NULL,
+      raw_sms_hash TEXT NOT NULL UNIQUE, sender_metadata TEXT NOT NULL DEFAULT '', balance_before NUMERIC(14,2),
+      balance_after NUMERIC(14,2), review_status TEXT NOT NULL DEFAULT 'pending_review', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
     INSERT INTO payment_settings(provider, account_number) VALUES
       ('bkash',''),('nagad',''),('rocket','') ON CONFLICT(provider) DO NOTHING;
   `);
@@ -239,55 +260,109 @@ app.get("/api/admin/settings",auth,admin,async(_req,res)=>{
  * Only accept provider-originated receipt messages that the collector has classified
  * and include raw SMS hash, sender metadata and amount/trx_id.
  */
+// Merchant onboarding and API credentials. New merchants are NOT approved automatically.
+const crypto = require("crypto");
+const hashSecret = value => crypto.createHash("sha256").update(String(value)).digest("hex");
+app.post("/api/merchant/apply",auth,async(req,res)=>{
+  const business=clean(req.body.business_name), website=clean(req.body.website);
+  if(business.length<2||business.length>120||website.length>300) return res.status(400).json({error:"Enter a valid business name and website."});
+  try {
+    const r=await pool.query("INSERT INTO merchants(user_id,business_name,website) VALUES($1,$2,$3) ON CONFLICT(user_id) DO UPDATE SET business_name=EXCLUDED.business_name,website=EXCLUDED.website RETURNING id,business_name,website,status,created_at",[req.user.id,business,website]);
+    res.status(201).json({merchant:r.rows[0]});
+  } catch(e){res.status(500).json({error:"Could not submit merchant application."});}
+});
+app.get("/api/merchant/me",auth,async(req,res)=>{
+  const r=await pool.query("SELECT id,business_name,website,status,created_at FROM merchants WHERE user_id=$1",[req.user.id]);
+  if(!r.rowCount) return res.json({merchant:null});
+  const m=r.rows[0];
+  const stats=await pool.query("SELECT COUNT(*)::int AS requests,COUNT(*) FILTER(WHERE status='success')::int AS successful,COALESCE(SUM(amount) FILTER(WHERE status='success'),0)::text AS total FROM payment_requests WHERE merchant_id=$1",[m.id]);
+  const keys=await pool.query("SELECT id,key_prefix,label,revoked,created_at FROM merchant_api_keys WHERE merchant_id=$1 ORDER BY id DESC",[m.id]);
+  const requests=await pool.query("SELECT public_id,amount,currency,description,status,created_at,expires_at FROM payment_requests WHERE merchant_id=$1 ORDER BY created_at DESC LIMIT 50",[m.id]);
+  res.json({merchant:m,stats:stats.rows[0],keys:keys.rows,requests:requests.rows});
+});
+app.post("/api/merchant/keys",auth,async(req,res)=>{
+  const m=await pool.query("SELECT id,status FROM merchants WHERE user_id=$1",[req.user.id]);
+  if(!m.rowCount) return res.status(400).json({error:"Apply for a merchant account first."});
+  if(m.rows[0].status!=="approved") return res.status(403).json({error:"Merchant must be approved before creating live API keys."});
+  const apiKey="sp_live_"+crypto.randomBytes(18).toString("hex"), secret="sps_"+crypto.randomBytes(32).toString("hex");
+  await pool.query("INSERT INTO merchant_api_keys(merchant_id,key_prefix,key_hash,secret_hash,label) VALUES($1,$2,$3,$4,$5)",[m.rows[0].id,apiKey.slice(0,14),hashSecret(apiKey),hashSecret(secret),clean(req.body.label).slice(0,60)||"Default key"]);
+  res.status(201).json({warning:"Copy these credentials now. The secret is shown only once. Do not put it in browser code.",api_key:apiKey,api_secret:secret});
+});
+app.post("/api/merchant/keys/:id/revoke",auth,async(req,res)=>{
+  const r=await pool.query("UPDATE merchant_api_keys k SET revoked=TRUE FROM merchants m WHERE k.merchant_id=m.id AND m.user_id=$1 AND k.id=$2 RETURNING k.id",[req.user.id,req.params.id]);
+  if(!r.rowCount)return res.status(404).json({error:"Key not found"});res.json({ok:true});
+});
+async function merchantApiAuth(req,res,next){
+  const key=clean(req.get("X-SojibPay-Key"));
+  if(!key.startsWith("sp_live_"))return res.status(401).json({error:"Merchant API key required."});
+  const r=await pool.query("SELECT k.id AS key_id,m.id AS merchant_id,m.status FROM merchant_api_keys k JOIN merchants m ON m.id=k.merchant_id WHERE k.key_hash=$1 AND k.revoked=FALSE",[hashSecret(key)]);
+  if(!r.rowCount||r.rows[0].status!=="approved")return res.status(403).json({error:"Merchant account or API key is not active."});
+  req.merchant=r.rows[0];next();
+}
+app.post("/api/v1/payment-requests",merchantApiAuth,async(req,res)=>{
+  const amount=Number(req.body.amount),description=clean(req.body.description),reference=clean(req.body.reference);
+  if(!Number.isFinite(amount)||amount<1||amount>1000000||description.length>250||reference.length>100)return res.status(400).json({error:"Invalid amount, description or reference."});
+  const publicId="spay_"+crypto.randomBytes(16).toString("hex");
+  const r=await pool.query("INSERT INTO payment_requests(merchant_id,public_id,amount,description,customer_reference) VALUES($1,$2,$3,$4,$5) RETURNING public_id,amount,currency,description,status,created_at,expires_at",[req.merchant.merchant_id,publicId,amount,description,reference]);
+  res.status(201).json({payment:r.rows[0],checkout_url:`${req.protocol}://${req.get("host")}/checkout.html?id=${publicId}`,note:"Checkout requests are records only until an approved payment provider is integrated."});
+});
+app.post("/api/merchant/requests",auth,async(req,res)=>{
+  const m=await pool.query("SELECT id,status FROM merchants WHERE user_id=$1",[req.user.id]);
+  if(!m.rowCount)return res.status(400).json({error:"Apply for a merchant account first."});
+  if(m.rows[0].status!=="approved")return res.status(403).json({error:"Merchant account must be approved before creating live payment requests."});
+  const amount=Number(req.body.amount),description=clean(req.body.description),reference=clean(req.body.reference);
+  if(!Number.isFinite(amount)||amount<1||amount>1000000||description.length>250||reference.length>100)return res.status(400).json({error:"Invalid amount, description or reference."});
+  const publicId="spay_"+crypto.randomBytes(16).toString("hex");
+  const r=await pool.query("INSERT INTO payment_requests(merchant_id,public_id,amount,description,customer_reference) VALUES($1,$2,$3,$4,$5) RETURNING public_id,amount,currency,description,status,created_at,expires_at",[m.rows[0].id,publicId,amount,description,reference]);
+  res.status(201).json({payment:r.rows[0],checkout_url:`${req.protocol}://${req.get("host")}/checkout.html?id=${publicId}`,note:"This is a request record, not a live provider checkout."});
+});
+app.get("/api/checkout/:publicId",async(req,res)=>{
+  const r=await pool.query("SELECT p.public_id,p.amount,p.currency,p.description,p.status,p.expires_at,m.business_name FROM payment_requests p JOIN merchants m ON m.id=p.merchant_id WHERE p.public_id=$1",[req.params.publicId]);
+  if(!r.rowCount)return res.status(404).json({error:"Payment request not found."});res.json({payment:r.rows[0]});
+});
+app.get("/api/admin/sms-receipts",auth,admin,async(_req,res)=>{
+  const r=await pool.query("SELECT id,provider,trx_id,amount,sender_metadata,balance_before,balance_after,review_status,created_at FROM sms_receipts ORDER BY created_at DESC LIMIT 300");res.json({receipts:r.rows});
+});
+app.get("/api/admin/merchants",auth,admin,async(_req,res)=>{
+  const r=await pool.query("SELECT m.*,u.email FROM merchants m JOIN users u ON u.id=m.user_id ORDER BY m.created_at DESC LIMIT 300");res.json({merchants:r.rows});
+});
+app.post("/api/admin/merchants/:id/status",auth,admin,async(req,res)=>{
+  const status=clean(req.body.status);if(!["pending_review","approved","suspended"].includes(status))return res.status(400).json({error:"Invalid merchant status."});
+  const r=await pool.query("UPDATE merchants SET status=$1 WHERE id=$2 RETURNING id,status,business_name",[status,req.params.id]);
+  if(!r.rowCount)return res.status(404).json({error:"Merchant not found."});
+  await pool.query("INSERT INTO audit_logs(admin_id,action,details) VALUES($1,'merchant_status_update',$2)",[req.user.id,JSON.stringify({merchant_id:req.params.id,status})]);res.json({merchant:r.rows[0]});
+});
+
 app.post("/api/connector/sms-receipt",async(req,res)=>{
   if(!safeEqual(req.get("X-SMS-Secret"),SMS_SECRET)) return res.status(401).json({error:"Unauthorized"});
-  const {provider,trx_id,amount,source_verified,raw_sms_hash}=req.body||{};
-  if(!["bkash","nagad","rocket"].includes(provider)||!clean(trx_id)||!Number.isFinite(Number(amount))||Number(amount)<=0||source_verified!==true||!clean(raw_sms_hash))
+  const {provider,trx_id,amount,raw_sms_hash,sender_metadata,balance_before,balance_after}=req.body||{};
+  if(!["bkash","nagad","rocket"].includes(provider)||!clean(trx_id)||!Number.isFinite(Number(amount))||Number(amount)<=0||!/^([a-f0-9]{64})$/i.test(clean(raw_sms_hash))||clean(sender_metadata).length>200)
     return res.status(400).json({error:"Invalid receipt payload"});
   const client=await pool.connect();
   try{
     await client.query("BEGIN");
-    const used=await client.query("SELECT id FROM payments WHERE LOWER(trx_id)=LOWER($1) FOR UPDATE",[clean(trx_id)]);
-    if(!used.rowCount){await client.query("ROLLBACK");return res.status(404).json({error:"No matching submitted transaction"});}
-    const p=await client.query("SELECT * FROM payments WHERE id=$1 FOR UPDATE",[used.rows[0].id]);
-    if(p.rows[0].provider!==provider||Number(p.rows[0].amount)!==Number(amount)||p.rows[0].status!=="pending"){
-      await client.query("ROLLBACK");return res.status(409).json({error:"Provider, amount or status mismatch; manual review required."});
+    const dup=await client.query("SELECT id FROM sms_receipts WHERE raw_sms_hash=$1",[clean(raw_sms_hash)]);
+    if(dup.rowCount){await client.query("ROLLBACK");return res.status(409).json({error:"SMS receipt already received"});}
+    const rec=await client.query("INSERT INTO sms_receipts(provider,trx_id,amount,raw_sms_hash,sender_metadata,balance_before,balance_after,review_status) VALUES($1,$2,$3,$4,$5,$6,$7,'pending_review') RETURNING id",[provider,clean(trx_id),amount,clean(raw_sms_hash),clean(sender_metadata),Number.isFinite(Number(balance_before))?Number(balance_before):null,Number.isFinite(Number(balance_after))?Number(balance_after):null]);
+    const used=await client.query("SELECT * FROM payments WHERE LOWER(trx_id)=LOWER($1) FOR UPDATE",[clean(trx_id)]);
+    if(used.rowCount){
+      const p=used.rows[0];
+      await client.query("UPDATE payments SET status='support_review',verification_source='sms_review' WHERE id=$1 AND status='pending'",[p.id]);
+      await client.query("INSERT INTO audit_logs(action,payment_id,details) VALUES('sms_receipt_review',$1,$2)",[p.id,JSON.stringify({receipt_id:rec.rows[0].id,provider_match:p.provider===provider,amount_match:Number(p.amount)===Number(amount),hash:raw_sms_hash})]);
+      await client.query("INSERT INTO support_messages(payment_id,sender_role,body) VALUES($1,'system','SMS receipt received. It is awaiting manual verification; it has not been auto-approved.')",[p.id]);
     }
-    const dup=await client.query("SELECT id FROM audit_logs WHERE action='sms_receipt_hash' AND details->>'hash'=$1",[clean(raw_sms_hash)]);
-    if(dup.rowCount){await client.query("ROLLBACK");return res.status(409).json({error:"SMS receipt already processed"});}
-    await client.query("UPDATE payments SET status='success',verification_source='sms',decided_at=NOW() WHERE id=$1",[p.rows[0].id]);
-    await client.query("INSERT INTO audit_logs(action,payment_id,details) VALUES('sms_receipt_hash',$1,$2)",[p.rows[0].id,JSON.stringify({hash:raw_sms_hash,provider,amount})]);
-    await client.query("INSERT INTO support_messages(payment_id,sender_role,body) VALUES($1,'system','Payment automatically verified from connector receipt.')",[p.rows[0].id]);
     await client.query("COMMIT");
-    broadcast({type:"payment_update",paymentId:p.rows[0].id});
-    res.json({ok:true,status:"success"});
+    res.status(202).json({ok:true,status:"pending_review",receipt_id:rec.rows[0].id,note:"SMS receipt is queued for review and never auto-approves a payment."});
   }catch(e){await client.query("ROLLBACK");res.status(500).json({error:"Receipt processing failed."});}
   finally{client.release();}
 });
-/* Privacy cleanup: remove transaction/support details after 12h from final decision.
-   Keep no raw SMS, screenshots or message attachments in this starter. */
+/* Retain payment records for reconciliation and duplicate prevention. Set retention policy with legal/accounting advice. */
 async function cleanup(){
-  try{
-    await pool.query("DELETE FROM payments WHERE status IN ('success','rejected') AND decided_at < NOW()-INTERVAL '12 hours'");
-    await pool.query("DELETE FROM support_messages WHERE payment_id IS NULL AND created_at < NOW()-INTERVAL '12 hours'");
-    await pool.query("DELETE FROM audit_logs WHERE created_at < NOW()-INTERVAL '30 days'");
-  }catch(e){console.error("Cleanup failed:",e.message);}
+  try { await pool.query("DELETE FROM audit_logs WHERE created_at < NOW()-INTERVAL '180 days'"); }
+  catch(e){ console.error("Cleanup failed:",e.message); }
 }
-setInterval(cleanup, 5*60*1000).unref();
-app.get("*", (req, res) => {
-  const indexPath = path.join(__dirname, "public", "index.html");
-
-  res.sendFile(indexPath, (err) => {
-    if (err) {
-      console.error("Homepage file error:", err.message);
-      if (!res.headersSent) {
-        res.status(500).send(
-          "Homepage file missing. Check public/index.html and deployment files."
-        );
-      }
-    }
-  });
-});
+setInterval(cleanup, 24*60*60*1000).unref();
+app.get("*",(req,res)=>res.sendFile(path.join(__dirname,"public","index.html")));
 wss.on("connection",(ws)=>{
   ws.send(JSON.stringify({type:"connected"}));
 });
