@@ -274,7 +274,20 @@ async function cleanup(){
   }catch(e){console.error("Cleanup failed:",e.message);}
 }
 setInterval(cleanup, 5*60*1000).unref();
-app.get("*",(req,res)=>res.sendFile(path.join(__dirname,"public","index.html")));
+app.get("*", (req, res) => {
+  const indexPath = path.join(__dirname, "public", "index.html");
+
+  res.sendFile(indexPath, (err) => {
+    if (err) {
+      console.error("Homepage file error:", err.message);
+      if (!res.headersSent) {
+        res.status(500).send(
+          "Homepage file missing. Check public/index.html and deployment files."
+        );
+      }
+    }
+  });
+});
 wss.on("connection",(ws)=>{
   ws.send(JSON.stringify({type:"connected"}));
 });
